@@ -118,15 +118,13 @@ def build_multi_input_model(vib_shape, num_classes):
     model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     return model
 
-# ==========================================
-# 5. 主程序逻辑
-# ==========================================
+
 def main_pipeline(data_path):
     raw_df = load_and_label_data(data_path)
-    # 获取三项：振动数据、风速数据、标签
+
     X_vib, X_vw, y, le = preprocess_pipeline(raw_df, window_size=250, overlap=10)
     
-    # 划分数据集 (需同步划分振动和风速)
+    # 划分数据集
     idx = np.arange(len(y))
     train_idx, test_idx = train_test_split(idx, test_size=0.2, random_state=42, stratify=y)
     
@@ -140,16 +138,24 @@ def main_pipeline(data_path):
     early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
     model.fit(
-        [X_vib_train, X_vw_train], y_train, # 传入两个输入
-        epochs=30, batch_size=16, 
+        [X_vib_train, X_vw_train], y_train,
+        epochs=30, batch_size=16,   # 10， 8
         validation_data=([X_vib_test, X_vw_test], y_test),
         callbacks=[early_stopping]
     )
     
-    # 评估
     y_pred = np.argmax(model.predict([X_vib_test, X_vw_test]), axis=1)
     print(classification_report(y_test, y_pred, target_names=le.classes_))
     return model
 
 if __name__ == "__main__":
-    trained_model = main_pipeline(r'D:\py_test\毕设\data')
+    data_path = r'D:\py_test\毕设\data'
+    save_path = r'D:\py_test\毕设\model'
+
+    trained_model = main_pipeline(data_path)
+    model_file = os.path.join(save_path, 'wind_turbine_fault_model.keras')
+    trained_model.save(model_file)
+    
+    print(f"模型已成功保存至: {model_file}")
+    
+    trained_model.save_weights(os.path.join(save_path, 'model_weights.weights.h5'))
