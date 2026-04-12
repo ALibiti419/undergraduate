@@ -2,9 +2,11 @@ import pandas as pd
 import numpy as np
 import os
 import glob
-import re
+import scipy.stats as stats
+from scipy.fft import fft
+import pywt
 import tensorflow as tf
-from tensorflow.keras import layers, models, Input
+from tensorflow.keras import layers, models
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
@@ -12,9 +14,48 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
-def load_and_label_data(directory_path):
-    all_data = []
+def extract_enhanced_features(signal, fs=1000):
+
+    feat = []
+    
+    feat.append(np.mean(signal))            # 均值
+    feat.append(np.std(signal))             # 标准差
+    feat.append(np.sqrt(np.mean(signal**2)))# 有效值 (RMS)
+    feat.append(stats.kurtosis(signal))     # 峰度
+    feat.append(stats.skew(signal))         # 偏度
+    # 方根幅值 (SRA)
+    sra = (np.mean(np.sqrt(np.abs(signal))))**2
+    feat.append(sra)
+    # 裕度因子 (Margin Factor)
+    feat.append(np.max(np.abs(signal)) / (sra + 1e-6))
+
+    # 频域特征
+    n = len(signal)
+    f_val = np.abs(fft(signal))[:n//2]
+    total_energy = np.sum(f_val**2) + 1e-6
+    feat.append(np.sum(f_val[:10]**2) / total_energy)  # 低频能量占比
+    feat.append(np.sum(f_val[10:50]**2) / total_energy) # 中频能量占比
+    feat.append(np.sum(f_val[50:]**2) / total_energy)  # 高频能量占比
+
+    # --- C. 时频域特征
+    # 使用 db4 小波进行 4 层分解
+    coeffs = pywt.wavedec(signal, 'db4', level=4)
+    energies = [np.sum(c**2) for c in coeffs]
+    total_e = sum(energies) + 1e-6
+    probs = [e/total_e for e in energies]
+    # 小波熵：反映信号波动的混乱程度
+    entropy = -np.sum([p * np.log(p+1e-6) for p in probs])
+    feat.append(entropy)
+    feat.extend(probs) # 将各层能量比例也作为特征输入
+        
+    return np.array(feat)
+
+
+def load_and_preprocess_with_resampling(directory_path, window_size=200, step_size=2):
+    all_features, all_labels = [], []
     files = glob.glob(os.path.join(directory_path, "*.*"))
+    
+    print(f"开始重采样提取特征（步长={step_size}）...")
     
     for file in files:
         file_name = os.path.basename(file)
@@ -25,137 +66,101 @@ def load_and_label_data(directory_path):
         elif 'twist' in file_name.lower() or 'twsist' in file_name.lower(): label = 'Twist'
         elif 'unbalance' in file_name.lower(): label = 'Unbalance'
         else: continue
-        
-
-        vw_match = re.search(r'Vw[a-zA-Z]*=([0-9.]+)', file_name)
-        
-        if vw_match:
-            vw_str = vw_match.group(1)
-            if vw_str.endswith('.'):
-                vw_str = vw_str[:-1]
-            try:
-                vw_val = float(vw_str)
-            except:
-                vw_val = 0.0
-        else:
-            vw_val = 0.0
             
         try:
             if file.endswith('.csv'):
                 df = pd.read_csv(file, sep=';', decimal='.', encoding='utf-8')
-            elif file.endswith('.xlsx'):
+            else:
                 df = pd.read_excel(file)
+                
+            data = df.iloc[:, 1].values # 提取 Amplitude 列
             
-            df.columns = ['Time', 'Amplitude']
-            df['Label'] = label
-            df['Vw'] = vw_val
-            df['Source'] = file_name
-            all_data.append(df)
+            # 
+            for i in range(0, len(data) - window_size + 1, step_size):
+                window = data[i : i + window_size]
+                features = extract_enhanced_features(window)
+                all_features.append(features)
+                all_labels.append(label)
         except Exception as e:
-            print(f"Error loading {file_name}: {e}")
+            print(f"处理文件 {file_name} 出错: {e}")
 
-    return pd.concat(all_data, ignore_index=True)
-
-
-def preprocess_pipeline(df, window_size=200, overlap=5):
-    segments, labels, winds = [], [], []
+    X = np.array(all_features)
+    y_raw = np.array(all_labels)
     
-    for source in df['Source'].unique():
-        subset = df[df['Source'] == source]
-        data = subset['Amplitude'].values
-        target = subset['Label'].iloc[0]
-        vw = subset['Vw'].iloc[0]
-        
-        if len(data) < window_size: continue
-        
-        for i in range(0, len(data) - window_size + 1, overlap):
-            segments.append(data[i : i + window_size])
-            labels.append(target)
-            winds.append(vw)
-            
-    X_vib = np.array(segments)
-    y_raw = np.array(labels)
-    X_vw = np.array(winds).reshape(-1, 1)
-    
-    # 标签编码
+    # 标签编码与标准化
     le = LabelEncoder()
     y = le.fit_transform(y_raw)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
     
-    # 振动信号标准化
-    scaler_vib = StandardScaler()
-    X_vib_scaled = scaler_vib.fit_transform(X_vib).reshape(-1, window_size, 1)
-    
-    # 风速标准化
-    scaler_vw = StandardScaler()
-    X_vw_scaled = scaler_vw.fit_transform(X_vw)
-    
-    return X_vib_scaled, X_vw_scaled, y, le
+    print(f"【采样成功】生成样本总数: {len(X)}, 覆盖特征维度: {X.shape[1]}")
+    return X_scaled, y, le
 
 
-def build_multi_input_model(vib_shape, num_classes):
-    # 振动信号处理 (CNN-LSTM)
-    vib_input = Input(shape=vib_shape, name='Vibration_Input')
-    x = layers.Conv1D(64, 3, activation='relu')(vib_input)
-    x = layers.BatchNormalization()(x)
-    x = layers.MaxPooling1D(2)(x)
-    x = layers.Conv1D(128, 3, activation='relu')(x)
-    x = layers.MaxPooling1D(2)(x)
-    x = layers.LSTM(64)(x)
+def build_robust_net(input_dim, num_classes):
+    model = models.Sequential([
+        layers.Input(shape=(input_dim,)),
+        layers.Dense(256, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.4),
+        layers.Dense(128, activation='relu'),
+        layers.BatchNormalization(),
+        layers.Dropout(0.3),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(num_classes, activation='softmax')
+    ])
     
-    # 风速数值处理
-    vw_input = Input(shape=(1,), name='WindSpeed_Input')
-    y = layers.Dense(16, activation='relu')(vw_input)
-    
-    # 特征融合
-    combined = layers.concatenate([x, y])
-    
-    # 共同决策层
-    z = layers.Dense(32, activation='relu')(combined)
-    z = layers.Dropout(0.3)(z)
-    output = layers.Dense(num_classes, activation='softmax')(z)
-    
-    model = models.Model(inputs=[vib_input, vw_input], outputs=output)
-    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    # 调低学习率以保证训练稳定性
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0005)
+    model.compile(optimizer=optimizer, 
+                  loss='sparse_categorical_crossentropy', 
+                  metrics=['accuracy'])
     return model
 
 
 def main_pipeline(data_path):
-    raw_df = load_and_label_data(data_path)
-
-    X_vib, X_vw, y, le = preprocess_pipeline(raw_df, window_size=250, overlap=10)
+    X, y, le = load_and_preprocess_with_resampling(data_path, window_size=200, step_size=2)
     
-    # 划分数据集
-    idx = np.arange(len(y))
-    train_idx, test_idx = train_test_split(idx, test_size=0.2, random_state=42, stratify=y)
-    
-    X_vib_train, X_vib_test = X_vib[train_idx], X_vib[test_idx]
-    X_vw_train, X_vw_test = X_vw[train_idx], X_vw[test_idx]
-    y_train, y_test = y[train_idx], y[test_idx]
-    
-    model = build_multi_input_model(vib_shape=(X_vib.shape[1], 1), num_classes=len(le.classes_))
-    
-    print("开始训练多输入模型...")
-    early_stopping = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
-
-    model.fit(
-        [X_vib_train, X_vw_train], y_train,
-        epochs=30, batch_size=16,   # 10， 8
-        validation_data=([X_vib_test, X_vw_test], y_test),
-        callbacks=[early_stopping]
+    # 2. 划分数据集
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
     
-    y_pred = np.argmax(model.predict([X_vib_test, X_vw_test]), axis=1)
+    # 3. 建模
+    model = build_robust_net(input_dim=X.shape[1], num_classes=len(le.classes_))
+    
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss', patience=8, restore_best_weights=True
+    )
+    
+    history = model.fit(
+        X_train, y_train,
+        epochs=100,
+        batch_size=64,
+        validation_split=0.1,
+        callbacks=[early_stopping],
+        verbose=1
+    )
+    
+    # 5. 评估结果
+    y_pred = np.argmax(model.predict(X_test), axis=1)
+
     print(classification_report(y_test, y_pred, target_names=le.classes_))
+    print("="*30)
+    
+    # 混淆矩阵可视化
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(confusion_matrix(y_test, y_pred), annot=True, fmt='d', cmap='YlGnBu',
+                xticklabels=le.classes_, yticklabels=le.classes_)
+    plt.title('Fault Diagnosis Confusion Matrix (Overlapping Sampling)')
+    plt.show()
+    
     return model
 
 if __name__ == "__main__":
-    data_path = r'D:\py_test\毕设\data'
-    save_path = r'D:\py_test\毕设\model'
-
-    trained_model = main_pipeline(data_path)
-    model_file = os.path.join(save_path, 'wind_turbine_fault_model.keras')
-    trained_model.save(model_file)
+    DATA_PATH = r'D:\py_test\毕设\data'
+    final_model = main_pipeline(DATA_PATH)
     
-    print(f"模型已成功保存至: {model_file}")
-    
-    trained_model.save_weights(os.path.join(save_path, 'model_weights.weights.h5'))
+    # 保存结果
+    if not os.path.exists(r'D:\py_test\毕设\model'): os.makedirs(r'D:\py_test\毕设\model')
+    final_model.save(r'D:\py_test\毕设\model\enhanced_feature_model.keras')
